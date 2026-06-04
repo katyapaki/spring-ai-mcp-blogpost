@@ -19,6 +19,18 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springaicommunity.mcp.annotation.McpProgressToken;
+import org.springaicommunity.mcp.annotation.McpTool;
+import org.springaicommunity.mcp.annotation.McpToolParam;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.MediaType;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
+
 import io.modelcontextprotocol.server.McpSyncServerExchange;
 import io.modelcontextprotocol.spec.McpSchema.CreateMessageRequest;
 import io.modelcontextprotocol.spec.McpSchema.CreateMessageResult;
@@ -29,12 +41,6 @@ import io.modelcontextprotocol.spec.McpSchema.ProgressNotification;
 import io.modelcontextprotocol.spec.McpSchema.Role;
 import io.modelcontextprotocol.spec.McpSchema.SamplingMessage;
 import io.modelcontextprotocol.spec.McpSchema.TextContent;
-import org.springaicommunity.mcp.annotation.McpProgressToken;
-import org.springaicommunity.mcp.annotation.McpTool;
-import org.springaicommunity.mcp.annotation.McpToolParam;
-
-import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestClient;
 
 /**
  * @author Christian Tzolov
@@ -42,40 +48,84 @@ import org.springframework.web.client.RestClient;
 @Service
 public class WeatherService {
 
-	private final RestClient restClient = RestClient.create();
+	private static final Logger logger = LoggerFactory.getLogger(WeatherService.class);
+
+	private final RestClient restClient;
+
+	private final ObjectMapper objectMapper;
+
+	@Value("${weather.sampling.enabled:false}")
+	private boolean samplingEnabled;
+
+	@Value("${weather.api.url:https://wttr.in/{latitude},{longitude}?format=j1}")
+	private String weatherApiUrl;
+
+	public WeatherService(@Value("${weather.api.connect-timeout-ms:3000}") int connectTimeoutMs,
+			@Value("${weather.api.read-timeout-ms:5000}") int readTimeoutMs, ObjectMapper objectMapper) {
+		SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
+		requestFactory.setConnectTimeout(connectTimeoutMs);
+		requestFactory.setReadTimeout(readTimeoutMs);
+		this.restClient = RestClient.builder().requestFactory(requestFactory).build();
+		this.objectMapper = objectMapper;
+	}
 
 	/**
-	 * The response format from the Open-Meteo API
+	 * The response format from the wttr.in API.
 	 */
-	public record WeatherResponse(Current current) {
-		public record Current(LocalDateTime time, int interval, double temperature_2m) {
+	public record WeatherResponse(List<CurrentCondition> current_condition) {
+		public record CurrentCondition(String temp_C, LocalDateTime localObsDateTime) {
 		}
 	}
 
 	@McpTool(description = "Get the temperature (in celsius) for a specific location")
 	public String getTemperature(McpSyncServerExchange exchange,
-			@McpToolParam(description = "The location latitude") double latitude,
-			@McpToolParam(description = "The location longitude") double longitude,
-			@McpProgressToken String progressToken) {
+			@McpToolParam(description = "The location latitude") Number latitude,
+			@McpToolParam(description = "The location longitude") Number longitude,
+			@McpProgressToken Object progressToken) {
+
+		double latitudeValue = latitude.doubleValue();
+		double longitudeValue = longitude.doubleValue();
 
 		exchange.loggingNotification(LoggingMessageNotification.builder()
 			.level(LoggingLevel.DEBUG)
-			.data("Call getTemperature Tool with latitude: " + latitude + " and longitude: " + longitude)
+			.data("Call getTemperature Tool with latitude: " + latitudeValue + " and longitude: " + longitudeValue)
 			.meta(Map.of()) // non null meata as a workaround for bug: ...
 			.build());
 
 		// 0% progress
 		exchange.progressNotification(new ProgressNotification(progressToken, 0.0, 1.0, "Retrieving weather forecast"));
 
-		WeatherResponse weatherResponse = restClient.get()
-			.uri("https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current=temperature_2m",
-					latitude, longitude)
-			.retrieve()
-			.body(WeatherResponse.class);
+		WeatherResponse weatherResponse;
+		double temperatureC;
+		try {
+			String weatherPayload = restClient.get()
+				.uri(weatherApiUrl, latitudeValue, longitudeValue)
+				.accept(MediaType.APPLICATION_JSON)
+				.retrieve()
+				.body(String.class);
 
-		String epicPoem = "MCP client doesn't provide sampling capability.";
+			weatherResponse = objectMapper.readValue(weatherPayload, WeatherResponse.class);
 
-		if (exchange.getClientCapabilities().sampling() != null) {
+			temperatureC = Double.parseDouble(weatherResponse.current_condition().get(0).temp_C());
+		}
+		catch (Exception e) {
+			logger.warn("getTemperature: weather provider call failed", e);
+			exchange.progressNotification(
+					new ProgressNotification(progressToken, 1.0, 1.0, "Weather provider unavailable"));
+			return """
+					Weather service unavailable right now.
+					Unable to reach weather provider for latitude: %s, longitude: %s.
+					""".formatted(latitudeValue, longitudeValue);
+		}
+
+		String epicPoem = "Sampling is disabled or unsupported by the client.";
+		boolean clientSupportsSampling = exchange.getClientCapabilities().sampling() != null;
+
+		logger.info("getTemperature: samplingEnabled={}, clientSupportsSampling={}, progressTokenType={}",
+				samplingEnabled, clientSupportsSampling,
+				(progressToken != null ? progressToken.getClass().getName() : "null"));
+
+		if (samplingEnabled && clientSupportsSampling) {
 
 			// 50% progress
 			exchange.progressNotification(new ProgressNotification(progressToken, 0.5, 1.0, "Start sampling"));
@@ -84,15 +134,27 @@ public class WeatherService {
 					For a weather forecast (temperature is in Celsius): %s.
 					At location with latitude: %s and longitude: %s.
 					Please write an epic poem about this forecast using a Shakespearean style.
-					""".formatted(weatherResponse.current().temperature_2m(), latitude, longitude);
+					""".formatted(temperatureC, latitudeValue, longitudeValue);
 
-			CreateMessageResult samplingResponse = exchange.createMessage(CreateMessageRequest.builder()
-				.systemPrompt("You are a poet!")
-				.messages(List.of(new SamplingMessage(Role.USER, new TextContent(samplingMessage))))
-				.modelPreferences(ModelPreferences.builder().addHint("anthropic").build())
-				.build());
+			try {
+				logger.info("getTemperature: sending createMessage sampling request");
 
-			epicPoem = ((TextContent) samplingResponse.content()).text();
+				CreateMessageResult samplingResponse = exchange.createMessage(CreateMessageRequest.builder()
+					.systemPrompt("You are a poet!")
+					.messages(List.of(new SamplingMessage(Role.USER, new TextContent(samplingMessage))))
+					.modelPreferences(ModelPreferences.builder().addHint("anthropic").build())
+					.maxTokens(512)
+					.build());
+
+				epicPoem = ((TextContent) samplingResponse.content()).text();
+				logger.info("getTemperature: sampling response received");
+			}
+			catch (Exception e) {
+				logger.warn("getTemperature: sampling request failed, continuing without sampled poem", e);
+			}
+		}
+		else {
+			logger.info("getTemperature: skipping sampling branch");
 
 		}
 
@@ -102,7 +164,7 @@ public class WeatherService {
 		return """
 				Weather Poem2: %s
 				about the weather: %s°C at location with latitude: %s and longitude: %s
-				""".formatted(epicPoem, weatherResponse.current().temperature_2m(), latitude, longitude);
+				""".formatted(epicPoem, temperatureC, latitudeValue, longitudeValue);
 	}
 
 }
